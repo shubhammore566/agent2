@@ -84,6 +84,8 @@ jobs:
         if: inputs.operation == 'deploy'
         env:
           GH_TOKEN: ${{ github.token }}
+          APP_GH_CLIENT_ID: ${{ secrets.APP_GH_CLIENT_ID }}
+          APP_GH_CLIENT_SECRET: ${{ secrets.APP_GH_CLIENT_SECRET }}
         run: |
           set -euo pipefail
           ID="${{ steps.target.outputs.instance_id }}"
@@ -94,6 +96,8 @@ jobs:
           [ -n "$SLUG" ] || SLUG="app"
           CLONE_URL="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
           CLONE_URL_B64="$(printf '%s' "$CLONE_URL" | base64 -w0)"
+          OAUTH_CID_B64="$(printf '%s' "${APP_GH_CLIENT_ID:-}" | base64 -w0)"
+          OAUTH_SECRET_B64="$(printf '%s' "${APP_GH_CLIENT_SECRET:-}" | base64 -w0)"
 
           cat > /tmp/agent-deploy.sh <<'SCRIPT'
           set -euo pipefail
@@ -223,7 +227,25 @@ jobs:
           fi
           test -n "$PORT" || { echo "No free host port found"; exit 3; }
           docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-          docker run -d --restart unless-stopped --name "$CONTAINER" -p "$PORT:$CPORT" "$IMAGE"
+          OAUTH_CID="$(printf '%s' "__OAUTH_CID_B64__" | base64 -d)"
+          OAUTH_SECRET="$(printf '%s' "__OAUTH_SECRET_B64__" | base64 -d)"
+          PUBLIC_IP="$(curl -s -m 2 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || true)"
+          PUBLIC_APP_URL="http://${PUBLIC_IP}:${PORT}"
+          RUN_ARGS=(-d --restart unless-stopped --name "$CONTAINER" -p "$PORT:$CPORT")
+          HOST_ENV=/opt/github-agent/.env
+          if [ -f "$HOST_ENV" ]; then
+            tr -d '\r' < "$HOST_ENV" > /tmp/agent-run.env
+            RUN_ARGS+=(--env-file /tmp/agent-run.env)
+            echo "OAUTH_ENV=loaded from $HOST_ENV"
+            if ! grep -q '^PUBLIC_APP_URL=' /tmp/agent-run.env; then RUN_ARGS+=(-e "PUBLIC_APP_URL=$PUBLIC_APP_URL"); fi
+          fi
+          if [ -n "$OAUTH_CID" ] && [ -n "$OAUTH_SECRET" ]; then
+            RUN_ARGS+=(-e "GITHUB_CLIENT_ID=$OAUTH_CID" -e "GITHUB_CLIENT_SECRET=$OAUTH_SECRET" -e "PUBLIC_APP_URL=$PUBLIC_APP_URL")
+            echo "OAUTH_ENV=configured"
+          else
+            echo "OAUTH_ENV=missing (set APP_GH_CLIENT_ID / APP_GH_CLIENT_SECRET repo secrets to enable GitHub OAuth on this deploy)"
+          fi
+          docker run "${RUN_ARGS[@]}" "$IMAGE"
           sleep 8
           if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo false)" != "true" ]; then
             echo "ERROR: container exited right after start. Last logs:"
@@ -234,7 +256,7 @@ jobs:
           echo "CONTAINER=$CONTAINER"
           echo "IMAGE=$IMAGE"
           SCRIPT
-          sed -i "s#__CLONE_URL_B64__#${CLONE_URL_B64}#g; s#__BRANCH__#${BRANCH}#g; s#__SLUG__#${SLUG}#g; s#__PORT__#${PORT}#g" /tmp/agent-deploy.sh
+          sed -i "s#__CLONE_URL_B64__#${CLONE_URL_B64}#g; s#__BRANCH__#${BRANCH}#g; s#__SLUG__#${SLUG}#g; s#__PORT__#${PORT}#g; s#__OAUTH_CID_B64__#${OAUTH_CID_B64}#g; s#__OAUTH_SECRET_B64__#${OAUTH_SECRET_B64}#g" /tmp/agent-deploy.sh
           COMMAND_B64="$(base64 -w0 /tmp/agent-deploy.sh)"
           PARAMS_JSON="$(jq -nc --arg c "echo $COMMAND_B64 | base64 -d | bash" "{commands:[\$c]}")"
           CID="$(aws ssm send-command --instance-ids "$ID" --document-name AWS-RunShellScript --parameters "$PARAMS_JSON" --query 'Command.CommandId' --output text)"
